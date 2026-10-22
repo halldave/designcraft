@@ -9,7 +9,8 @@
 //!   and mark it saved; exports (PDF, PNG, IDML…) add `export: true`.
 //! - `designcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away
 //!   in any open document.
-//! - `designcraft:failed` (to the parent): `{ error }` when the app couldn't start.
+//! - `designcraft:failed` (to the parent): `{ error }` when the app couldn't start, or when an
+//!   opened file is larger than [`MAX_OPEN_BYTES`] (it isn't copied or opened).
 //!
 //! Only the parent window on the page's own origin is heard or answered; a parent on another
 //! origin gets no bridge (saves download as usual). In host mode `?sample` is ignored.
@@ -22,6 +23,10 @@ use designcraft_ui_egui::{ImportRequest, ImportedFile, Inbox, Services};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
+
+/// Largest file the parent may send with `designcraft:open`: the same 256 MiB the engine allows
+/// for the other files it reads (linked files, data-merge data and images).
+const MAX_OPEN_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Bridge {
@@ -85,6 +90,7 @@ impl Bridge {
     }
 
     fn listen(&self, inbox: Inbox, ctx: egui::Context) {
+        let bridge = self.clone();
         let parent = self.parent.clone();
         let origin = self.origin.clone();
         let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
@@ -96,7 +102,16 @@ impl Bridge {
                 return;
             }
             let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Untitled.designcraft".to_string());
-            let Some(bytes) = bytes(&data) else { return };
+            let Some(array) = byte_array(&data) else { return };
+            // Refuse oversize files before copying them out of the parent's buffer.
+            if u64::from(array.byte_length()) > MAX_OPEN_BYTES {
+                bridge.post_failed(&format!(
+                    "{name} is {} bytes, larger than the {MAX_OPEN_BYTES}-byte limit for opened files",
+                    array.byte_length()
+                ));
+                return;
+            }
+            let bytes = array.to_vec();
             let request = ImportRequest { purpose: "open".into(), target: None };
             inbox.lock().unwrap_or_else(|e| e.into_inner()).push(ImportedFile { request, name, bytes });
             ctx.request_repaint();
@@ -131,13 +146,13 @@ fn string(data: &JsValue, key: &str) -> Option<String> {
     js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_string()
 }
 
-/// `bytes` as an `ArrayBuffer` or `Uint8Array`.
-fn bytes(data: &JsValue) -> Option<Vec<u8>> {
+/// `bytes` (an `ArrayBuffer` or `Uint8Array`) as a view, not yet copied.
+fn byte_array(data: &JsValue) -> Option<js_sys::Uint8Array> {
     let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
     if let Some(array) = bytes.dyn_ref::<js_sys::Uint8Array>() {
-        Some(array.to_vec())
+        Some(array.clone())
     } else if bytes.is_instance_of::<js_sys::ArrayBuffer>() {
-        Some(js_sys::Uint8Array::new(&bytes).to_vec())
+        Some(js_sys::Uint8Array::new(&bytes))
     } else {
         None
     }
